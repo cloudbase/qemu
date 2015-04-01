@@ -40,6 +40,7 @@
 #define FTYPE_FILE 0
 #define FTYPE_CD     1
 #define FTYPE_HARDDISK 2
+#define WINDOWS_VISTA 6
 
 typedef struct RawWin32AIOData {
     BlockDriverState *bs;
@@ -57,6 +58,10 @@ typedef struct BDRVRawState {
     char drive_path[16]; /* format: "d:\" */
     QEMUWin32AIOState *aio;
 } BDRVRawState;
+
+typedef struct BDRVRawReopenState {
+    HANDLE hfile;
+} BDRVRawReopenState;
 
 /*
  * Read/writes the data to/from a given linear buffer.
@@ -323,6 +328,114 @@ static bool get_aio_option(QemuOpts *opts, int flags, Error **errp)
         error_setg(errp, "Invalid AIO option");
     }
     return false;
+}
+
+static int raw_reopen_prepare(BDRVReopenState *state, BlockReopenQueue *queue, Error **errp)
+{
+    BDRVRawState *s;
+    BDRVRawReopenState *raw_s;
+    int ret = 0;
+    int access_flags;
+    DWORD overlapped;
+    OSVERSIONINFO osvi;
+
+    assert(state != NULL);
+    assert(state->bs != NULL);
+
+    s = state->bs->opaque;
+
+    state->opaque = g_malloc0(sizeof(BDRVRawReopenState));
+    raw_s = state->opaque;
+
+    Error *local_err = NULL;
+    QemuOpts *opts;
+    bool use_aio;
+    opts = qemu_opts_create(&raw_runtime_opts, NULL, 0, &error_abort);
+    use_aio = get_aio_option(opts, state->flags, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        ret = -EINVAL;
+        goto fail;
+    }
+
+    raw_parse_flags(state->flags, use_aio, &access_flags, &overlapped);
+
+    ZeroMemory(&osvi, sizeof(OSVERSIONINFO));
+    osvi.dwOSVersionInfoSize = sizeof(OSVERSIONINFO);
+
+    GetVersionEx(&osvi);
+    raw_s->hfile = INVALID_HANDLE_VALUE;
+
+    if (osvi.dwMajorVersion >= WINDOWS_VISTA) {
+        raw_s->hfile = ReOpenFile(s->hfile, access_flags, FILE_SHARE_READ,
+                                  overlapped);
+    }
+
+    /* could not reopen the file handle, so fall back to opening
+     * new file (CreateFile) */
+    if (raw_s->hfile == INVALID_HANDLE_VALUE) {
+        raw_s->hfile = CreateFile(state->bs->filename, access_flags,
+                                  FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                  overlapped, NULL);
+        if (raw_s->hfile == INVALID_HANDLE_VALUE) {
+            /* this could happen because the access_flags requested are
+             * incompatible with the existing share mode of s->hfile,
+             * so our only option now is to close s->hfile, and try again.
+             * This could end badly */
+            CloseHandle(s->hfile);
+            s->hfile = INVALID_HANDLE_VALUE;
+            raw_s->hfile = CreateFile(state->bs->filename, access_flags,
+                                      FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                                      overlapped, NULL);
+            if (raw_s->hfile == INVALID_HANDLE_VALUE) {
+                /* Unrecoverable error */
+                error_set(errp, ERROR_CLASS_GENERIC_ERROR,
+                          "Fatal error reopening %s file; file closed and cannot be opened\n",
+                          state->bs->filename);
+                ret = -1;
+            } else{
+                /* since we had to close the original, go ahead and
+                 * re-assign here */
+                s->hfile = raw_s->hfile;
+                raw_s->hfile = INVALID_HANDLE_VALUE;
+            }
+        }
+    }
+
+    return ret;
+fail:
+    qemu_opts_del(opts);
+    return ret;
+}
+
+static void raw_reopen_commit(BDRVReopenState *state)
+{
+    BDRVRawReopenState *raw_s = state->opaque;
+    BDRVRawState *s = state->bs->opaque;
+
+    if (raw_s->hfile != INVALID_HANDLE_VALUE) {
+        CloseHandle(s->hfile);
+        s->hfile = raw_s->hfile;
+    }
+
+    g_free(state->opaque);
+    state->opaque = NULL;
+}
+
+static void raw_reopen_abort(BDRVReopenState *state)
+{
+    BDRVRawReopenState *raw_s = state->opaque;
+
+     /* nothing to do if NULL, we didn't get far enough */
+    if (raw_s == NULL) {
+        return;
+    }
+
+    if (raw_s->hfile != INVALID_HANDLE_VALUE) {
+        CloseHandle(raw_s->hfile);
+    }
+    g_free(state->opaque);
+    state->opaque = NULL;
 }
 
 static int raw_open(BlockDriverState *bs, QDict *options, int flags,
@@ -634,6 +747,9 @@ BlockDriver bdrv_file = {
     .bdrv_parse_filename = raw_parse_filename,
     .bdrv_file_open     = raw_open,
     .bdrv_refresh_limits = raw_probe_alignment,
+    .bdrv_reopen_prepare = raw_reopen_prepare,
+    .bdrv_reopen_commit = raw_reopen_commit,
+    .bdrv_reopen_abort = raw_reopen_abort,
     .bdrv_close         = raw_close,
     .bdrv_co_create_opts = raw_co_create_opts,
     .bdrv_has_zero_init = bdrv_has_zero_init_1,
