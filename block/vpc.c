@@ -422,6 +422,8 @@ static int rewrite_footer(BlockDriverState* bs)
     int ret;
     BDRVVPCState *s = bs->opaque;
     int64_t offset = s->free_data_block_offset;
+    /* 512B Header + Footer copy + 1024B Dynamic Disk Header*/
+    offset = ROUND_UP(offset + 2048, 1 << 20) - 2048;
 
     ret = bdrv_pwrite_sync(bs->file, offset, s->footer_buf, HEADER_SIZE);
     if (ret < 0)
@@ -672,7 +674,7 @@ static int create_dynamic_disk(BlockDriverState *bs, uint8_t *buf,
         goto fail;
     }
 
-    offset = 1536 + ((num_bat_entries * 4 + 511) & ~511);
+    offset = 1536 + ROUND_UP(((num_bat_entries * 4 + 511) & ~511), 1 << 20);
     ret = bdrv_pwrite_sync(bs, offset, buf, HEADER_SIZE);
     if (ret < 0) {
         goto fail;
@@ -723,6 +725,9 @@ static int create_fixed_disk(BlockDriverState *bs, uint8_t *buf,
                              int64_t total_size)
 {
     int ret;
+
+    /* Azure requires 1MB aligned images. */
+    total_size = ROUND_UP(total_size, 1 << 20);
 
     /* Add footer to total size */
     total_size += HEADER_SIZE;
