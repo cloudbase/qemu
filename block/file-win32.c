@@ -199,12 +199,14 @@ int qemu_ftruncate64(int fd, int64_t length)
     return res ? 0 : -1;
 }
 
+/*
 static int set_sparse(int fd)
 {
     DWORD returned;
     return (int) DeviceIoControl((HANDLE)_get_osfhandle(fd), FSCTL_SET_SPARSE,
                                  NULL, 0, NULL, 0, &returned, NULL);
 }
+*/
 
 static void raw_detach_aio_context(BlockDriverState *bs)
 {
@@ -580,7 +582,7 @@ static int raw_co_create(BlockdevCreateOptions *options, Error **errp)
         error_setg_errno(errp, errno, "Could not create file");
         return -EIO;
     }
-    set_sparse(fd);
+    //set_sparse(fd);
     ftruncate(fd, file_opts->size);
     qemu_close(fd);
 
